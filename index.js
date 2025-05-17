@@ -34,6 +34,7 @@ dotenv.config();
 
 // Environment variables with defaults
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+const TELEGRAM_BOT_NAME = process.env.TELEGRAM_BOT_NAME || '';
 const MUTASIKU_API_KEY = process.env.MUTASIKU_API_KEY || '';
 const DB_PATH = process.env.DB_PATH;
 
@@ -285,12 +286,12 @@ function setupBotCommands(bot, sdk, sessionManager) {
       userId: ctx.from?.id
     });
     
-    await ctx.reply(`Selamat datang di Bot Mutasiku! 🤖\n\nBot ini akan mengirimkan notifikasi saat Anda menerima dana di akun yang terhubung.\n\nGunakan /mutasi untuk melihat transaksi terbaru Anda atau /accounts untuk melihat akun Anda.`);
+    await ctx.reply(`Selamat datang di ${TELEGRAM_BOT_NAME}! 🤖\n\nBot ini akan mengirimkan notifikasi saat Anda menerima dana di akun yang terhubung.\n\nGunakan /mutasi untuk melihat transaksi terbaru Anda atau /accounts untuk melihat akun Anda.`);
   });
 
   // Help command
   bot.help((ctx) => {
-    ctx.reply(`Bantuan Bot Mutasiku:\n
+    ctx.reply(`Bantuan ${TELEGRAM_BOT_NAME}:\n
   /start - Mulai bot
   /add - Tambahkan akun e-wallet baru
   /remove - Hapus akun e-wallet yang ada
