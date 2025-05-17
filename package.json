@@ -1,0 +1,26 @@
+{
+  "name": "mutasiku-telegram-sdk",
+  "version": "1.0.0",
+  "description": "A Telegram bot that integrates with the Mutasiku API to help users monitor transactions and manage e-wallet accounts (DANA, OVO, GoPay Merchant) directly through Telegram.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [
+    "mutasiku",
+    "dana api",
+    "ovo api",
+    "gopay merchant api",
+    "telegram"
+  ],
+  "author": "Septian992",
+  "license": "MIT",
+  "dependencies": {
+    "dotenv": "^16.5.0",
+    "mutasiku-sdk": "^1.0.0",
+    "sqlite": "^5.1.1",
+    "sqlite3": "^5.1.7",
+    "telegraf": "^4.16.3",
+    "winston": "^3.17.0"
+  }
+}
