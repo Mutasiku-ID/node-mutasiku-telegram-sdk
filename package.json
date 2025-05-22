@@ -13,6 +13,7 @@
     "gopay merchant api",
     "telegram"
   ],
+  "type": "module",
   "author": "Septian992",
   "license": "MIT",
   "dependencies": {
