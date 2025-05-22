@@ -32,7 +32,10 @@ import {
   updateSessionData, 
   getSessionData, 
   deleteSessionData, 
-  createSessionData 
+  createSessionData,
+  hasActiveProcessSession,
+  cleanupProcessSessions,
+  getSessionByType
 } from './lib/sessionUtils.js';
 import { 
   isUserAuthenticated, 
@@ -139,7 +142,8 @@ async function setupDatabase() {
   await db.exec(`
     CREATE INDEX IF NOT EXISTS idx_sessions_chatId ON sessions(chatId);
     CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires);
-    CREATE INDEX IF NOT EXISTS idx_sessions_type ON sessions(type)
+    CREATE INDEX IF NOT EXISTS idx_sessions_type ON sessions(type);
+    CREATE INDEX IF NOT EXISTS idx_sessions_chatId_type ON sessions(chatId, type)
   `);
   
   logger.info('database.init', 'Database initialized successfully');
@@ -156,7 +160,22 @@ function initializeSessionManager(db) {
   const createSession = async (chatId, type, data = {}) => {
     const sessionId = `${chatId}_${type}_${Date.now()}`;
     const now = Date.now();
-    const expires = now + (15 * 60 * 1000); // 15 minutes default
+    
+    // Set different expiry times based on session type
+    let expires;
+    switch (type) {
+      case 'authenticated':
+        expires = now + (24 * 60 * 60 * 1000); // 24 hours for authenticated sessions
+        break;
+      case 'auth_attempts':
+        expires = now + (60 * 60 * 1000); // 1 hour for auth attempts tracking
+        break;
+      case 'login':
+        expires = now + (5 * 60 * 1000); // 5 minutes for login process
+        break;
+      default:
+        expires = now + (15 * 60 * 1000); // 15 minutes for other processes
+    }
     
     await db.run(
       'INSERT INTO sessions (id, chatId, type, state, data, expires, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?)',
@@ -213,6 +232,67 @@ function initializeSessionManager(db) {
   };
 
   /**
+   * Get active session excluding specific types (e.g., authenticated sessions)
+   */
+  const getActiveSession = async (chatId, excludeTypes = ['authenticated']) => {
+    const now = Date.now();
+    
+    let query = 'SELECT * FROM sessions WHERE chatId = ? AND expires > ?';
+    let params = [chatId, now];
+    
+    if (excludeTypes.length > 0) {
+      const placeholders = excludeTypes.map(() => '?').join(',');
+      query += ` AND type NOT IN (${placeholders})`;
+      params.push(...excludeTypes);
+    }
+    
+    query += ' ORDER BY createdAt DESC LIMIT 1';
+    
+    const row = await db.get(query, ...params);
+    
+    if (!row) return null;
+    
+    return {
+      id: row.id,
+      chatId: row.chatId,
+      type: row.type,
+      state: row.state,
+      data: JSON.parse(row.data),
+      expires: new Date(row.expires),
+      createdAt: new Date(row.createdAt)
+    };
+  };
+
+  /**
+   * Get all active sessions for a chatId
+   */
+  const getAllSessions = async (chatId, type = null) => {
+    const now = Date.now();
+    
+    let query = 'SELECT * FROM sessions WHERE chatId = ? AND expires > ?';
+    let params = [chatId, now];
+    
+    if (type) {
+      query += ' AND type = ?';
+      params.push(type);
+    }
+    
+    query += ' ORDER BY createdAt DESC';
+    
+    const rows = await db.all(query, ...params);
+    
+    return rows.map(row => ({
+      id: row.id,
+      chatId: row.chatId,
+      type: row.type,
+      state: row.state,
+      data: JSON.parse(row.data),
+      expires: new Date(row.expires),
+      createdAt: new Date(row.createdAt)
+    }));
+  };
+
+  /**
    * Update an existing session
    */
   const updateSession = async (sessionId, updates) => {
@@ -234,11 +314,15 @@ function initializeSessionManager(db) {
     if (updates.data) {
       updatedSession.data = { ...updatedSession.data, ...updates.data };
     }
+    if (updates.expires) {
+      updatedSession.expires = new Date(updates.expires);
+    }
     
     await db.run(
-      'UPDATE sessions SET state = ?, data = ? WHERE id = ?',
+      'UPDATE sessions SET state = ?, data = ?, expires = ? WHERE id = ?',
       updatedSession.state,
       JSON.stringify(updatedSession.data),
+      updatedSession.expires.getTime(),
       sessionId
     );
     
@@ -260,6 +344,24 @@ function initializeSessionManager(db) {
     const result = await db.run('DELETE FROM sessions WHERE chatId = ? AND type = ?', chatId, type);
     return result.changes > 0;
   };
+
+  /**
+   * Delete all sessions for a chatId except specific types
+   */
+  const deleteSessionsExceptTypes = async (chatId, keepTypes = ['authenticated']) => {
+    if (keepTypes.length === 0) {
+      const result = await db.run('DELETE FROM sessions WHERE chatId = ?', chatId);
+      return result.changes > 0;
+    }
+    
+    const placeholders = keepTypes.map(() => '?').join(',');
+    const result = await db.run(
+      `DELETE FROM sessions WHERE chatId = ? AND type NOT IN (${placeholders})`,
+      chatId,
+      ...keepTypes
+    );
+    return result.changes > 0;
+  };
   
   /**
    * Extend session expiration time
@@ -276,14 +378,67 @@ function initializeSessionManager(db) {
     
     return result.changes > 0;
   };
+
+  /**
+   * Check if there are any active process sessions (excluding auth sessions)
+   */
+  const hasActiveProcessSession = async (chatId) => {
+    const now = Date.now();
+    const row = await db.get(
+      'SELECT COUNT(*) as count FROM sessions WHERE chatId = ? AND expires > ? AND type NOT IN (?, ?)',
+      chatId,
+      now,
+      'authenticated',
+      'auth_attempts'
+    );
+    return row.count > 0;
+  };
+
+  /**
+   * Clean up expired sessions for a specific chatId
+   */
+  const cleanupExpiredSessions = async (chatId) => {
+    const now = Date.now();
+    const result = await db.run('DELETE FROM sessions WHERE chatId = ? AND expires < ?', chatId, now);
+    return result.changes > 0;
+  };
+
+  /**
+   * Get session statistics for debugging
+   */
+  const getSessionStats = async (chatId = null) => {
+    const now = Date.now();
+    
+    if (chatId) {
+      const stats = await db.all(
+        'SELECT type, COUNT(*) as count FROM sessions WHERE chatId = ? AND expires > ? GROUP BY type',
+        chatId,
+        now
+      );
+      return stats;
+    } else {
+      const stats = await db.all(
+        'SELECT type, COUNT(*) as count FROM sessions WHERE expires > ? GROUP BY type',
+        now
+      );
+      return stats;
+    }
+  };
   
   return {
     createSession,
     getSession,
+    getActiveSession,
+    getAllSessions,
     updateSession,
     deleteSession,
     deleteSessionsByType,
-    extendSession
+    deleteSessionsExceptTypes,
+    extendSession,
+    hasActiveProcessSession,
+    cleanupExpiredSessions,
+    getSessionStats,
+    db // Expose database for direct queries when needed
   };
 }
 
@@ -348,11 +503,8 @@ function setupBotCommands(bot, sdk, sessionManager) {
       return await ctx.reply(`🚫 ${blockStatus.message}`);
     }
 
-    // Clear any existing session that's not auth_attempts
-    const existingSession = await sessionManager.getSession(chatId);
-    if (existingSession && existingSession.type !== 'auth_attempts') {
-      await sessionManager.deleteSession(existingSession.id);
-    }
+    // Clear any existing non-auth sessions
+    await cleanupProcessSessions(chatId, sessionManager, ['authenticated', 'auth_attempts']);
 
     // Create login session
     const session = await sessionManager.createSession(chatId, 'login', {});
@@ -386,8 +538,6 @@ function setupBotCommands(bot, sdk, sessionManager) {
     const chatId = ctx.chat?.id.toString();
     if (!chatId) return;
 
-    console.log("test");
-    
     const isAuthenticated = await isUserAuthenticated(chatId, sessionManager);
     if (!isAuthenticated) {
       return await ctx.reply(
@@ -538,10 +688,10 @@ Anda dapat menggabungkan filter: /mutasi days 30 type credit min 500000
       );
     }
     
-    // Delete any active session
-    const session = await getSessionData(chatId, sessionManager);
-    if (session) {
-      await deleteSessionData(session.id, sessionManager);
+    // Delete any active process session (but keep authentication)
+    const hasActiveProcess = await hasActiveProcessSession(chatId, sessionManager);
+    if (hasActiveProcess) {
+      await cleanupProcessSessions(chatId, sessionManager, ['authenticated', 'auth_attempts']);
       await ctx.reply('Tindakan dibatalkan. Ketik /add atau /transfer untuk memulai kembali.');
     } else {
       await ctx.reply('Tidak ada tindakan yang sedang berlangsung.');
@@ -566,9 +716,9 @@ async function handleTransferCommand(ctx, sdk, sessionManager) {
   }
 
   try {
-    // Check for existing session
-    const existingSession = await getSessionData(chatId, sessionManager);
-    if (existingSession) {
+    // Check for existing active process sessions (exclude authenticated sessions)
+    const hasActiveProcess = await hasActiveProcessSession(chatId, sessionManager);
+    if (hasActiveProcess) {
       await ctx.reply('Anda memiliki proses yang sedang berlangsung. Silakan selesaikan atau ketik /cancel untuk membatalkan.');
       return;
     }
@@ -610,7 +760,7 @@ async function handleTransferCommand(ctx, sdk, sessionManager) {
       // Create keyboard for account selection
       const keyboard = danaAccounts.map((account) => [
         { 
-          text: `${account.phoneNumber} - ${account.name} - ${formatCurrency(account.balance)}`, 
+          text: `${account.name} - ${formatCurrency(account.balance)}`, 
           callback_data: `transfer_account:${account.id}` 
         }
       ]);
@@ -777,12 +927,12 @@ function parseMutasiOptions(args) {
   }
   
   return options;
-}
-
-/**
+ }
+ 
+ /**
  * Handle accounts command
  */
-async function handleAccountsCommand(ctx, sdk) {
+ async function handleAccountsCommand(ctx, sdk) {
   const chatId = ctx.chat?.id.toString();
   if (!chatId) {
     logger.error('telegram.accounts', 'No chat context found');
@@ -830,12 +980,12 @@ async function handleAccountsCommand(ctx, sdk) {
     logger.error('telegram.accounts', 'Error fetching user info', { error });
     await ctx.reply('Gagal memverifikasi akun Anda. Silakan coba lagi nanti.');
   }
-}
-
-/**
+ }
+ 
+ /**
  * Handle remove command
  */
-async function handleRemoveCommand(ctx, sdk) {
+ async function handleRemoveCommand(ctx, sdk) {
   const chatId = ctx.chat?.id.toString();
   if (!chatId) return;
   
@@ -908,12 +1058,12 @@ async function handleRemoveCommand(ctx, sdk) {
     logger.error('telegram.remove', 'Error preparing remove command', { error });
     await ctx.reply('Gagal mempersiapkan daftar akun. Silakan coba lagi nanti.');
   }
-}
-
-/**
+ }
+ 
+ /**
  * Handle add command
  */
-async function handleAddCommand(ctx, sessionManager) {
+ async function handleAddCommand(ctx, sessionManager) {
   const chatId = ctx.chat?.id.toString();
   if (!chatId) {
     logger.error('telegram.add', 'No chat context found');
@@ -921,9 +1071,9 @@ async function handleAddCommand(ctx, sessionManager) {
   }
   
   try {
-    // Check for existing session
-    const existingSession = await getSessionData(chatId, sessionManager);
-    if (existingSession) {
+    // Check for existing active process sessions (exclude authenticated sessions)
+    const hasActiveProcess = await hasActiveProcessSession(chatId, sessionManager);
+    if (hasActiveProcess) {
       await ctx.reply('Anda memiliki proses yang sedang berlangsung. Silakan selesaikan atau ketik /cancel untuk membatalkan.');
       return;
     }
@@ -972,25 +1122,25 @@ async function handleAddCommand(ctx, sessionManager) {
     logger.error('telegram.add', 'Error in add command', { error });
     await ctx.reply('Gagal memulai proses penambahan akun. Silakan coba lagi nanti.');
   }
-}
-
-/**
+ }
+ 
+ /**
  * Handle bank transfer amount input with improved UX
  */
-async function handleBankAmountInput(ctx, session, sdk, sessionManager) {
+ async function handleBankAmountInput(ctx, session, sdk, sessionManager) {
   if (!ctx.message?.text) {
     return await ctx.reply('Input tidak valid. Silakan masukkan jumlah yang valid.');
   }
-
+ 
   const amountText = ctx.message.text.trim().replace(/[.,]/g, '');
   const amount = parseInt(amountText);
-
+ 
   if (isNaN(amount) || amount < 10000) {
     return await ctx.reply('Jumlah tidak valid. Minimum transfer ke bank adalah Rp 10.000.\n\nSilakan masukkan jumlah yang valid:');
   }
-
+ 
   const loadingMsg = await ctx.reply('Memuat daftar bank... 🔄');
-
+ 
   try {
     const banksResponse = await sdk.getDanaBanks(session.data.accountId);
     
@@ -1003,7 +1153,7 @@ async function handleBankAmountInput(ctx, session, sdk, sessionManager) {
       );
       return;
     }
-
+ 
     // Update session with amount and banks
     await updateSessionData(session, sessionManager, {
       state: 'selecting_bank_method',
@@ -1012,7 +1162,7 @@ async function handleBankAmountInput(ctx, session, sdk, sessionManager) {
         availableBanks: banksResponse.data 
       }
     });
-
+ 
     // Show bank selection options
     const selectionKeyboard = [
       [{ text: '🔍 Cari Bank', callback_data: 'search_bank' }],
@@ -1020,7 +1170,7 @@ async function handleBankAmountInput(ctx, session, sdk, sessionManager) {
       [{ text: '📋 Semua Bank (A-Z)', callback_data: 'all_banks_az' }],
       [{ text: '❌ Batal', callback_data: 'cancel_transfer' }]
     ];
-
+ 
     await ctx.telegram.editMessageText(
       ctx.chat.id,
       loadingMsg.message_id,
@@ -1042,22 +1192,22 @@ async function handleBankAmountInput(ctx, session, sdk, sessionManager) {
       '❌ Gagal memproses jumlah. Silakan coba lagi nanti.'
     );
   }
-}
-
-/**
+ }
+ 
+ /**
  * Bank search handler
  */
-async function handleBankSearch(ctx, session, sessionManager) {
+ async function handleBankSearch(ctx, session, sessionManager) {
   if (!ctx.message?.text) {
     return await ctx.reply('Silakan ketik nama bank yang ingin dicari.');
   }
-
+ 
   const searchTerm = ctx.message.text.trim().toLowerCase();
   
   if (searchTerm.length < 2) {
     return await ctx.reply('Ketik minimal 2 karakter untuk mencari bank.\n\nContoh: BCA, Mandiri, BNI');
   }
-
+ 
   const allBanks = session.data.availableBanks;
   
   // Search banks by name
@@ -1066,14 +1216,14 @@ async function handleBankSearch(ctx, session, sessionManager) {
     return bankName.includes(searchTerm) || 
            bank.instId.toLowerCase().includes(searchTerm);
   });
-
+ 
   if (matchingBanks.length === 0) {
     return await ctx.reply(
       `❌ Tidak ditemukan bank dengan kata kunci: "<b>${ctx.message.text}</b>"\n\n💡 Coba kata kunci lain:\n• BCA\n• Mandiri\n• BNI\n• BRI\n• CIMB\n\nAtau ketik /cancel untuk membatalkan.`,
-     { parse_mode: 'HTML' }
-   );
+      { parse_mode: 'HTML' }
+    );
   }
-
+ 
   if (matchingBanks.length === 1) {
     // Only one match, select it automatically
     const bankData = matchingBanks[0];
@@ -1082,10 +1232,10 @@ async function handleBankSearch(ctx, session, sessionManager) {
       state: 'awaiting_account_number',
       data: { bankData }
     });
-
+ 
     const bankName = bankData.name || bankData.instLocalName;
     const transferAmount = formatCurrency(session.data.amount);
-
+ 
     await ctx.reply(
       `✅ <b>Bank ditemukan: ${bankName}</b>\n💰 <b>Jumlah: ${transferAmount}</b>\n\n📝 Silakan masukkan nomor rekening tujuan (8-20 digit):`,
       { parse_mode: 'HTML' }
@@ -1108,9 +1258,9 @@ async function handleBankSearch(ctx, session, sessionManager) {
     
     bankKeyboard.push([{ text: '🔍 Cari Lagi', callback_data: 'search_bank' }]);
     bankKeyboard.push([{ text: '❌ Batal', callback_data: 'cancel_transfer' }]);
-
+ 
     const transferAmount = formatCurrency(session.data.amount);
-
+ 
     await ctx.reply(
       `🔍 <b>Hasil pencarian "${ctx.message.text}":</b>\n💰 <b>Jumlah: ${transferAmount}</b>\n\nDitemukan ${matchingBanks.length} bank:`,
       {
@@ -1120,18 +1270,18 @@ async function handleBankSearch(ctx, session, sessionManager) {
         parse_mode: 'HTML'
       }
     );
-
+ 
     // Update session with search results
     await updateSessionData(session, sessionManager, {
       data: { searchResults: matchingBanks }
     });
   }
-}
-
-/**
-* Helper function for bank pagination
-*/
-function showBankPage(ctx, session, banks, page) {
+ }
+ 
+ /**
+ * Helper function for bank pagination
+ */
+ function showBankPage(ctx, session, banks, page) {
   const BANKS_PER_PAGE = 15;
   const startIndex = page * BANKS_PER_PAGE;
   const endIndex = Math.min(startIndex + BANKS_PER_PAGE, banks.length);
@@ -1159,10 +1309,10 @@ function showBankPage(ctx, session, banks, page) {
   
   bankKeyboard.push([{ text: '🔍 Cari Bank', callback_data: 'search_bank' }]);
   bankKeyboard.push([{ text: '❌ Batal', callback_data: 'cancel_transfer' }]);
-
+ 
   const transferAmount = formatCurrency(session.data.amount);
   const totalPages = Math.ceil(banks.length / BANKS_PER_PAGE);
-
+ 
   ctx.editMessageText(
     `💰 <b>Jumlah transfer: ${transferAmount}</b>\n\n📋 <b>Semua Bank (A-Z)</b>\nHalaman ${page + 1} dari ${totalPages} • Bank ${startIndex + 1}-${endIndex} dari ${banks.length}`,
     {
@@ -1172,18 +1322,18 @@ function showBankPage(ctx, session, banks, page) {
       parse_mode: 'HTML'
     }
   );
-}
-
-/**
-* Set up all callback actions
-*/
-function setupCallbackActions(bot, sdk, sessionManager) {
+ }
+ 
+ /**
+ * Set up all callback actions
+ */
+ function setupCallbackActions(bot, sdk, sessionManager) {
   // Handle cancel button
   bot.action('cancel_remove', async (ctx) => {
     await ctx.answerCbQuery('Dibatalkan');
     await ctx.editMessageText('Tindakan dibatalkan. Gunakan /remove untuk memulai kembali.');
   });
-
+ 
   // Handle account selection for removal
   bot.action(/^remove:(.+)$/, async (ctx) => {
     const accountId = ctx.match[1];
@@ -1205,7 +1355,7 @@ function setupCallbackActions(bot, sdk, sessionManager) {
       }
     );
   });
-
+ 
   // Handle confirmation for removal
   bot.action(/^confirm:(.+)$/, async (ctx) => {
     const accountId = ctx.match[1];
@@ -1219,7 +1369,7 @@ function setupCallbackActions(bot, sdk, sessionManager) {
     
     // Acknowledge the action
     await ctx.answerCbQuery('Memproses...');
-
+ 
     // Update message to show processing
     await ctx.editMessageText(
       '⏳ Menghapus akun... Mohon tunggu.',
@@ -1241,7 +1391,7 @@ function setupCallbackActions(bot, sdk, sessionManager) {
       await ctx.editMessageText('❌ Error menghapus akun. Silakan coba lagi nanti.');
     }
   });
-
+ 
   // Handle transfer account selection
   bot.action(/^transfer_account:(.+)$/, async (ctx) => {
     const accountId = ctx.match[1];
@@ -1251,7 +1401,7 @@ function setupCallbackActions(bot, sdk, sessionManager) {
       await ctx.answerCbQuery('Error: Tidak dapat memproses permintaan');
       return;
     }
-
+ 
     try {
       await ctx.answerCbQuery();
       
@@ -1259,19 +1409,19 @@ function setupCallbackActions(bot, sdk, sessionManager) {
       const session = await createSessionData(chatId, 'dana_transfer', { 
         accountId 
       }, sessionManager);
-
+ 
       // Update session state
       await updateSessionData(session, sessionManager, {
         state: 'select_transfer_type'
       });
-
+ 
       // Show transfer type options
       const transferKeyboard = [
         [{ text: '🏦 Transfer ke Bank', callback_data: 'transfer_type:bank' }],
         [{ text: '📱 Bayar QRIS', callback_data: 'transfer_type:qris' }],
         [{ text: 'Batal', callback_data: 'cancel_transfer' }]
       ];
-
+ 
       await ctx.editMessageText(
         'Pilih jenis transfer:',
         {
@@ -1285,7 +1435,7 @@ function setupCallbackActions(bot, sdk, sessionManager) {
       await ctx.answerCbQuery('Gagal memproses pilihan');
     }
   });
-
+ 
   // Handle transfer type selection
   bot.action(/^transfer_type:(.+)$/, async (ctx) => {
     const transferType = ctx.match[1]; // 'bank' or 'qris'
@@ -1295,7 +1445,7 @@ function setupCallbackActions(bot, sdk, sessionManager) {
       await ctx.answerCbQuery('Error: Tidak dapat memproses permintaan');
       return;
     }
-
+ 
     try {
       await ctx.answerCbQuery();
       
@@ -1305,7 +1455,7 @@ function setupCallbackActions(bot, sdk, sessionManager) {
         await ctx.editMessageText('Sesi tidak valid. Silakan mulai kembali dengan /transfer.');
         return;
       }
-
+ 
       if (transferType === 'bank') {
         // Bank transfer flow
         await ctx.editMessageText('Silakan masukkan jumlah yang ingin ditransfer (minimum Rp 10.000):');
@@ -1328,7 +1478,7 @@ function setupCallbackActions(bot, sdk, sessionManager) {
       await ctx.answerCbQuery('Gagal memproses pilihan');
     }
   });
-
+ 
   // Handle search bank option
   bot.action('search_bank', async (ctx) => {
     const chatId = ctx.callbackQuery?.message?.chat.id.toString();
@@ -1337,7 +1487,7 @@ function setupCallbackActions(bot, sdk, sessionManager) {
       await ctx.answerCbQuery('Error: Tidak dapat memproses permintaan');
       return;
     }
-
+ 
     try {
       await ctx.answerCbQuery();
       
@@ -1347,14 +1497,14 @@ function setupCallbackActions(bot, sdk, sessionManager) {
         await ctx.editMessageText('Sesi tidak valid. Silakan mulai kembali dengan /transfer.');
         return;
       }
-
+ 
       // Update session state to search mode
       await updateSessionData(session, sessionManager, {
         state: 'searching_bank'
       });
-
+ 
       const transferAmount = formatCurrency(session.data.amount);
-
+ 
       await ctx.editMessageText(
         `💰 <b>Jumlah transfer: ${transferAmount}</b>\n\n🔍 <b>Cari Bank</b>\n\nKetik nama bank yang ingin Anda cari:\n\nContoh:\n• BCA\n• Mandiri\n• BNI\n• BRI\n\nAtau ketik /cancel untuk membatalkan.`,
         { parse_mode: 'HTML' }
@@ -1364,7 +1514,7 @@ function setupCallbackActions(bot, sdk, sessionManager) {
       await ctx.answerCbQuery('Gagal memulai pencarian');
     }
   });
-
+ 
   // Handle popular banks
   bot.action('popular_banks', async (ctx) => {
     const chatId = ctx.callbackQuery?.message?.chat.id.toString();
@@ -1373,7 +1523,7 @@ function setupCallbackActions(bot, sdk, sessionManager) {
       await ctx.answerCbQuery('Error: Tidak dapat memproses permintaan');
       return;
     }
-
+ 
     try {
       await ctx.answerCbQuery();
       
@@ -1382,18 +1532,18 @@ function setupCallbackActions(bot, sdk, sessionManager) {
         await ctx.editMessageText('Sesi tidak valid. Silakan mulai kembali dengan /transfer.');
         return;
       }
-
+ 
       // Define popular banks by instId
       const popularBankIds = [
         'BCAC1ID', 'MDRIC1ID', 'BNIC1ID', 'BRIC1ID', 'CITIC1ID',
         'MABKC1ID', 'PANIC1ID', 'BNLIC1ID', 'DBSC1ID', 'UOBC1ID'
       ];
-
+ 
       const allBanks = session.data.availableBanks;
       const popularBanks = popularBankIds
         .map(id => allBanks.find(bank => bank.instId === id))
         .filter(bank => bank !== undefined);
-
+ 
       const bankKeyboard = popularBanks.map((bank, index) => [
         { 
           text: `${bank.name || bank.instLocalName}`, 
@@ -1404,9 +1554,9 @@ function setupCallbackActions(bot, sdk, sessionManager) {
       bankKeyboard.push([{ text: '🔍 Cari Bank Lain', callback_data: 'search_bank' }]);
       bankKeyboard.push([{ text: '📋 Semua Bank', callback_data: 'all_banks_az' }]);
       bankKeyboard.push([{ text: '❌ Batal', callback_data: 'cancel_transfer' }]);
-
+ 
       const transferAmount = formatCurrency(session.data.amount);
-
+ 
       await ctx.editMessageText(
         `💰 <b>Jumlah transfer: ${transferAmount}</b>\n\n⭐ <b>Bank Populer:</b>`,
         {
@@ -1421,7 +1571,7 @@ function setupCallbackActions(bot, sdk, sessionManager) {
       await ctx.answerCbQuery('Gagal memuat bank populer');
     }
   });
-
+ 
   // Handle all banks A-Z
   bot.action('all_banks_az', async (ctx) => {
     const chatId = ctx.callbackQuery?.message?.chat.id.toString();
@@ -1430,7 +1580,7 @@ function setupCallbackActions(bot, sdk, sessionManager) {
       await ctx.answerCbQuery('Error: Tidak dapat memproses permintaan');
       return;
     }
-
+ 
     try {
       await ctx.answerCbQuery();
       
@@ -1439,26 +1589,26 @@ function setupCallbackActions(bot, sdk, sessionManager) {
         await ctx.editMessageText('Sesi tidak valid. Silakan mulai kembali dengan /transfer.');
         return;
       }
-
+ 
       // Sort banks alphabetically and show first 15
       const allBanks = [...session.data.availableBanks].sort((a, b) => 
         (a.name || a.instLocalName).localeCompare(b.name || b.instLocalName)
       );
-
+ 
       await updateSessionData(session, sessionManager, {
         data: { 
           sortedBanks: allBanks,
           currentPage: 0
         }
       });
-
+ 
       showBankPage(ctx, session, allBanks, 0);
     } catch (error) {
       logger.error('telegram.all_banks', 'Error showing all banks', { error });
       await ctx.answerCbQuery('Gagal memuat semua bank');
     }
   });
-
+ 
   // Handle bank page navigation
   bot.action(/^bank_page:(\d+)$/, async (ctx) => {
     const page = parseInt(ctx.match[1]);
@@ -1468,7 +1618,7 @@ function setupCallbackActions(bot, sdk, sessionManager) {
       await ctx.answerCbQuery('Error: Tidak dapat memproses permintaan');
       return;
     }
-
+ 
     try {
       await ctx.answerCbQuery();
       
@@ -1477,18 +1627,19 @@ function setupCallbackActions(bot, sdk, sessionManager) {
         await ctx.editMessageText('Sesi tidak valid. Silakan mulai kembali dengan /transfer.');
         return;
       }
-
+ 
       await updateSessionData(session, sessionManager, {
         data: { currentPage: page }
       });
-
+ 
       showBankPage(ctx, session, session.data.sortedBanks, page);
     } catch (error) {
       logger.error('telegram.bank_page', 'Error navigating bank page', { error });
       await ctx.answerCbQuery('Gagal memuat halaman');
     }
   });
-
+ 
+  // Handle bank selection
   // Handle bank selection
   bot.action(/^select_bank:(\d+)$/, async (ctx) => {
     const chatId = ctx.callbackQuery?.message?.chat.id.toString();
