@@ -34,6 +34,12 @@ import {
   deleteSessionData, 
   createSessionData 
 } from './lib/sessionUtils.js';
+import { 
+  isUserAuthenticated, 
+  authenticateUser, 
+  isUserBlocked, 
+  logoutUser
+} from './lib/authHandler.js';
 
 // Load environment variables
 dotenv.config();
@@ -132,7 +138,8 @@ async function setupDatabase() {
   // Create indexes for faster lookups
   await db.exec(`
     CREATE INDEX IF NOT EXISTS idx_sessions_chatId ON sessions(chatId);
-    CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires)
+    CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires);
+    CREATE INDEX IF NOT EXISTS idx_sessions_type ON sessions(type)
   `);
   
   logger.info('database.init', 'Database initialized successfully');
@@ -147,9 +154,9 @@ function initializeSessionManager(db) {
    * Create a new session
    */
   const createSession = async (chatId, type, data = {}) => {
-    const sessionId = `${chatId}_${Date.now()}`;
+    const sessionId = `${chatId}_${type}_${Date.now()}`;
     const now = Date.now();
-    const expires = now + (15 * 60 * 1000); // 15 minutes
+    const expires = now + (15 * 60 * 1000); // 15 minutes default
     
     await db.run(
       'INSERT INTO sessions (id, chatId, type, state, data, expires, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?)',
@@ -175,15 +182,22 @@ function initializeSessionManager(db) {
 
   /**
    * Get the most recent active session for a chatId
+   * If type is specified, get that specific type
    */
-  const getSession = async (chatId) => {
+  const getSession = async (chatId, type = null) => {
     const now = Date.now();
     
-    const row = await db.get(
-      'SELECT * FROM sessions WHERE chatId = ? AND expires > ? ORDER BY createdAt DESC LIMIT 1',
-      chatId,
-      now
-    );
+    let query = 'SELECT * FROM sessions WHERE chatId = ? AND expires > ?';
+    let params = [chatId, now];
+    
+    if (type) {
+      query += ' AND type = ?';
+      params.push(type);
+    }
+    
+    query += ' ORDER BY createdAt DESC LIMIT 1';
+    
+    const row = await db.get(query, ...params);
     
     if (!row) return null;
     
@@ -240,6 +254,14 @@ function initializeSessionManager(db) {
   };
   
   /**
+   * Delete all sessions for a chatId and type
+   */
+  const deleteSessionsByType = async (chatId, type) => {
+    const result = await db.run('DELETE FROM sessions WHERE chatId = ? AND type = ?', chatId, type);
+    return result.changes > 0;
+  };
+  
+  /**
    * Extend session expiration time
    */
   const extendSession = async (sessionId, minutes = 15) => {
@@ -260,6 +282,7 @@ function initializeSessionManager(db) {
     getSession,
     updateSession,
     deleteSession,
+    deleteSessionsByType,
     extendSession
   };
 }
@@ -292,19 +315,104 @@ function setupBotCommands(bot, sdk, sessionManager) {
       userId: ctx.from?.id
     });
     
-    await ctx.reply(`Selamat datang di ${TELEGRAM_BOT_NAME}! 🤖\n\nBot ini akan mengirimkan notifikasi saat Anda menerima dana di akun yang terhubung.\n\nGunakan /mutasi untuk melihat transaksi terbaru Anda atau /accounts untuk melihat akun Anda.`);
+    const chatId = ctx.chat?.id.toString();
+    const isAuthenticated = await isUserAuthenticated(chatId, sessionManager);
+    
+    if (isAuthenticated) {
+      await ctx.reply(`Selamat datang kembali di ${TELEGRAM_BOT_NAME}! 🤖\n\nAnda sudah login. Gunakan /help untuk melihat perintah yang tersedia.`);
+    } else {
+      await ctx.reply(
+        `Selamat datang di ${TELEGRAM_BOT_NAME}! 🤖\n\n` +
+        '🔐 <b>Akses Terbatas</b>\n' +
+        'Bot ini memerlukan autentikasi sebelum digunakan.\n\n' +
+        '🔑 Gunakan perintah /login untuk masuk.\n',
+        { parse_mode: 'HTML' }
+      );
+    }
   });
 
-  // Help command
-  bot.help((ctx) => {
+  // Login command
+  bot.command('login', async (ctx) => {
+    const chatId = ctx.chat?.id.toString();
+    if (!chatId) return;
+
+    // Check if already authenticated
+    const isAuthenticated = await isUserAuthenticated(chatId, sessionManager);
+    if (isAuthenticated) {
+      return await ctx.reply('✅ Anda sudah login!\n\nGunakan /logout untuk keluar atau /help untuk melihat perintah yang tersedia.');
+    }
+
+    // Check if user is blocked
+    const blockStatus = await isUserBlocked(chatId, sessionManager);
+    if (blockStatus.blocked) {
+      return await ctx.reply(`🚫 ${blockStatus.message}`);
+    }
+
+    // Clear any existing session that's not auth_attempts
+    const existingSession = await sessionManager.getSession(chatId);
+    if (existingSession && existingSession.type !== 'auth_attempts') {
+      await sessionManager.deleteSession(existingSession.id);
+    }
+
+    // Create login session
+    const session = await sessionManager.createSession(chatId, 'login', {});
+    await sessionManager.updateSession(session.id, { state: 'awaiting_password' });
+
+    let message = '🔐 <b>Login ke Bot</b>\n\nSilakan masukkan password:';
+    
+    if (blockStatus.attemptsLeft) {
+      message += `\n\n⚠️ Sisa percobaan: ${blockStatus.attemptsLeft}`;
+    }
+
+    await ctx.reply(message, { parse_mode: 'HTML' });
+  });
+
+  // Logout command
+  bot.command('logout', async (ctx) => {
+    const chatId = ctx.chat?.id.toString();
+    if (!chatId) return;
+
+    const success = await logoutUser(chatId, sessionManager);
+    
+    if (success) {
+      await ctx.reply('✅ Anda telah logout.\n\nGunakan /login untuk masuk kembali.');
+    } else {
+      await ctx.reply('❌ Anda belum login.');
+    }
+  });
+
+  // Protected commands with individual auth checks
+  bot.command('help', async (ctx) => {
+    const chatId = ctx.chat?.id.toString();
+    if (!chatId) return;
+
+    console.log("test");
+    
+    const isAuthenticated = await isUserAuthenticated(chatId, sessionManager);
+    if (!isAuthenticated) {
+      return await ctx.reply(
+        '🔐 <b>Akses Terbatas</b>\n\n' +
+        'Anda harus login terlebih dahulu untuk menggunakan bot ini.\n\n' +
+        'Gunakan perintah /login untuk masuk.',
+        { parse_mode: 'HTML' }
+      );
+    }
+
     ctx.reply(`Bantuan ${TELEGRAM_BOT_NAME}:
 
-/start - Mulai bot
+🔐 <b>Autentikasi:</b>
+/login - Login ke bot
+/logout - Logout dari bot
+
+📱 <b>Manajemen Akun:</b>
 /add - Tambahkan akun e-wallet baru
 /remove - Hapus akun e-wallet yang ada
 /accounts - Lihat semua akun Anda
+
+💸 <b>Transfer:</b>
 /transfer - Transfer dana dari akun DANA Anda
 
+📊 <b>Transaksi:</b>
 /mutasi - Lihat transaksi terbaru Anda
   Filter dasar:
   • /mutasi limit 10 - Tampilkan 10 transaksi
@@ -322,28 +430,113 @@ function setupBotCommands(bot, sdk, sessionManager) {
 
 Anda dapat menggabungkan filter: /mutasi days 30 type credit min 500000
 
-/help - Tampilkan pesan bantuan ini`);
+/help - Tampilkan pesan bantuan ini`, { parse_mode: 'HTML' });
   });
 
-  // Mutasi command
-  bot.command('mutasi', async (ctx) => handleMutasiCommand(ctx, sdk));
+  // Mutasi command with auth check
+  bot.command('mutasi', async (ctx) => {
+    const chatId = ctx.chat?.id.toString();
+    if (!chatId) return;
+    
+    const isAuthenticated = await isUserAuthenticated(chatId, sessionManager);
+    if (!isAuthenticated) {
+      return await ctx.reply(
+        '🔐 <b>Akses Terbatas</b>\n\n' +
+        'Anda harus login terlebih dahulu untuk menggunakan bot ini.\n\n' +
+        'Gunakan perintah /login untuk masuk.',
+        { parse_mode: 'HTML' }
+      );
+    }
+    
+    await handleMutasiCommand(ctx, sdk);
+  });
   
-  // Accounts command
-  bot.command('accounts', async (ctx) => handleAccountsCommand(ctx, sdk));
+  // Accounts command with auth check
+  bot.command('accounts', async (ctx) => {
+    const chatId = ctx.chat?.id.toString();
+    if (!chatId) return;
+    
+    const isAuthenticated = await isUserAuthenticated(chatId, sessionManager);
+    if (!isAuthenticated) {
+      return await ctx.reply(
+        '🔐 <b>Akses Terbatas</b>\n\n' +
+        'Anda harus login terlebih dahulu untuk menggunakan bot ini.\n\n' +
+        'Gunakan perintah /login untuk masuk.',
+        { parse_mode: 'HTML' }
+      );
+    }
+    
+    await handleAccountsCommand(ctx, sdk);
+  });
   
-  // Remove command
-  bot.command('remove', async (ctx) => handleRemoveCommand(ctx, sdk));
+  // Remove command with auth check
+  bot.command('remove', async (ctx) => {
+    const chatId = ctx.chat?.id.toString();
+    if (!chatId) return;
+    
+    const isAuthenticated = await isUserAuthenticated(chatId, sessionManager);
+    if (!isAuthenticated) {
+      return await ctx.reply(
+        '🔐 <b>Akses Terbatas</b>\n\n' +
+        'Anda harus login terlebih dahulu untuk menggunakan bot ini.\n\n' +
+        'Gunakan perintah /login untuk masuk.',
+        { parse_mode: 'HTML' }
+      );
+    }
+    
+    await handleRemoveCommand(ctx, sdk);
+  });
   
-  // Add command
-  bot.command('add', async (ctx) => handleAddCommand(ctx, sessionManager));
+  // Add command with auth check
+  bot.command('add', async (ctx) => {
+    const chatId = ctx.chat?.id.toString();
+    if (!chatId) return;
+    
+    const isAuthenticated = await isUserAuthenticated(chatId, sessionManager);
+    if (!isAuthenticated) {
+      return await ctx.reply(
+        '🔐 <b>Akses Terbatas</b>\n\n' +
+        'Anda harus login terlebih dahulu untuk menggunakan bot ini.\n\n' +
+        'Gunakan perintah /login untuk masuk.',
+        { parse_mode: 'HTML' }
+      );
+    }
+    
+    await handleAddCommand(ctx, sessionManager);
+  });
   
-  // Transfer command
-  bot.command('transfer', async (ctx) => handleTransferCommand(ctx, sdk, sessionManager));
+  // Transfer command with auth check
+  bot.command('transfer', async (ctx) => {
+    const chatId = ctx.chat?.id.toString();
+    if (!chatId) return;
+    
+    const isAuthenticated = await isUserAuthenticated(chatId, sessionManager);
+    if (!isAuthenticated) {
+      return await ctx.reply(
+        '🔐 <b>Akses Terbatas</b>\n\n' +
+        'Anda harus login terlebih dahulu untuk menggunakan bot ini.\n\n' +
+        'Gunakan perintah /login untuk masuk.',
+        { parse_mode: 'HTML' }
+      );
+    }
+    
+    await handleTransferCommand(ctx, sdk, sessionManager);
+  });
   
-  // Cancel command
+  // Cancel command with auth check
   bot.command('cancel', async (ctx) => {
     const chatId = ctx.chat?.id.toString();
     if (!chatId) return;
+    
+    const isAuthenticated = await isUserAuthenticated(chatId, sessionManager);
+    if (!isAuthenticated) {
+      return await ctx.reply(
+        '🔐 <b>Akses Terbatas</b>\n\n' +
+        'Anda harus login terlebih dahulu untuk menggunakan bot ini.\n\n' +
+        'Gunakan perintah /login untuk masuk.',
+        { parse_mode: 'HTML' }
+      );
+    }
     
     // Delete any active session
     const session = await getSessionData(chatId, sessionManager);
@@ -354,12 +547,12 @@ Anda dapat menggabungkan filter: /mutasi days 30 type credit min 500000
       await ctx.reply('Tidak ada tindakan yang sedang berlangsung.');
     }
   });
-  
-  // Callback actions
-  setupCallbackActions(bot, sdk, sessionManager);
-  
-  // Text message handler
+
+  // Set up text message handler BEFORE other commands
   setupTextMessageHandler(bot, sessionManager, sdk);
+  
+  // Set up callback actions
+  setupCallbackActions(bot, sdk, sessionManager);
 }
 
 /**
@@ -1501,6 +1694,9 @@ function setupTextMessageHandler(bot, sessionManager, sdk) {
     
     // Handle different session states
     switch(session.state) {
+      case 'awaiting_password':
+        await handlePasswordInput(ctx, session, sessionManager);
+        break;
       case 'awaiting_phone':
         await handlePhoneInput(ctx, session, sessionManager);
         break;
@@ -1855,6 +2051,87 @@ async function handleTransferConfirmation(ctx, session, sdk, sessionManager) {
     await ctx.reply('❌ Transfer dibatalkan.\n\n🔄 Gunakan /transfer untuk memulai transfer baru.');
   } else {
     await ctx.reply('❓ Perintah tidak dikenali.\n\nSilakan ketik:\n• <b>KONFIRMASI</b> - untuk melanjutkan transfer\n• <b>BATAL</b> - untuk membatalkan transfer', { parse_mode: 'HTML' });
+  }
+}
+
+async function handlePasswordInput(ctx, session, sessionManager) {
+  if (!ctx.message?.text) {
+    return await ctx.reply('Input tidak valid. Silakan masukkan password.');
+  }
+  
+  const password = ctx.message.text.trim();
+  const chatId = ctx.chat?.id.toString();
+  if (!chatId) return;
+
+  logger.info('telegram.password', `Password input received for chat ${chatId}`);
+
+  // Delete the user's message for security
+  try {
+    await ctx.deleteMessage();
+  } catch (error) {
+    // Ignore if can't delete message
+  }
+
+  // Check if user is blocked
+  const blockStatus = await isUserBlocked(chatId, sessionManager);
+  if (blockStatus.blocked) {
+    await sessionManager.deleteSession(session.id);
+    return await ctx.reply(`🚫 ${blockStatus.message}`);
+  }
+
+  const statusMsg = await ctx.reply('🔐 Memverifikasi password...');
+
+  try {
+    const result = await authenticateUser(chatId, password, sessionManager);
+    
+    if (result.success) {
+      logger.info('telegram.password', `Authentication successful for chat ${chatId}`);
+      
+      await ctx.telegram.editMessageText(
+        chatId,
+        statusMsg.message_id,
+        undefined,
+        '✅ Login berhasil!\n\nSelamat datang! Gunakan /help untuk melihat perintah yang tersedia.'
+      );
+      
+      // Delete login session
+      await sessionManager.deleteSession(session.id);
+      
+      // Verify the authenticated session was created
+      const authSession = await sessionManager.getSession(chatId, 'authenticated');
+      if (authSession) {
+        logger.info('telegram.password', `Authenticated session confirmed for chat ${chatId}`);
+      } else {
+        logger.error('telegram.password', `Failed to create authenticated session for chat ${chatId}`);
+      }
+    } else {
+      logger.info('telegram.password', `Authentication failed for chat ${chatId}: ${result.message}`);
+      
+      const newBlockStatus = await isUserBlocked(chatId, sessionManager);
+      let message = `❌ ${result.message}`;
+      
+      if (newBlockStatus.attemptsLeft && newBlockStatus.attemptsLeft > 0) {
+        message += `\n\n⚠️ Sisa percobaan: ${newBlockStatus.attemptsLeft}`;
+      } else if (newBlockStatus.blocked) {
+        message += `\n\n🚫 Terlalu banyak percobaan gagal. Coba lagi dalam ${newBlockStatus.remainingMinutes} menit.`;
+        await sessionManager.deleteSession(session.id);
+      }
+      
+      await ctx.telegram.editMessageText(
+        chatId,
+        statusMsg.message_id,
+        undefined,
+        message
+      );
+    }
+  } catch (error) {
+    logger.error('telegram.auth', 'Error during authentication', { error });
+    await ctx.telegram.editMessageText(
+      chatId,
+      statusMsg.message_id,
+      undefined,
+      '❌ Terjadi kesalahan saat login. Silakan coba lagi.'
+    );
   }
 }
 

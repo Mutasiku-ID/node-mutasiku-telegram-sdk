@@ -1,13 +1,15 @@
 # Mutasiku Telegram Bot SDK
 
-A Telegram bot that integrates with the Mutasiku API to help users monitor transactions, manage e-wallet accounts (DANA, OVO, GoPay Merchant), and perform transfers directly through Telegram.
+A secure Telegram bot that integrates with the Mutasiku API to help users monitor transactions, manage e-wallet accounts (DANA, OVO, GoPay Merchant), and perform transfers directly through Telegram.
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Node Version](https://img.shields.io/badge/node-%3E%3D14.0.0-brightgreen)
 ![Telegram Bot](https://img.shields.io/badge/Telegram-Bot-blue.svg)
+![Security](https://img.shields.io/badge/Security-Password%20Protected-red.svg)
 
 ## 📌 Features
 
+- **🔐 Password Protection**: Secure access with configurable password authentication
 - **Account Management**: Add, remove, and view e-wallet accounts
 - **Transaction Monitoring**: Get real-time notifications when you receive funds
 - **Transaction History**: View your transaction history with various filtering options
@@ -17,6 +19,7 @@ A Telegram bot that integrates with the Mutasiku API to help users monitor trans
 - **Multiple Wallet Support**: Supports DANA, OVO, and GoPay Merchant
 - **🔍 Smart Search**: Find banks quickly with intelligent search functionality
 - **⭐ Popular Banks**: Quick access to most commonly used banks
+- **🛡️ Session Management**: Secure session handling with automatic expiry
 
 ## 📋 Prerequisites
 
@@ -39,10 +42,16 @@ A Telegram bot that integrates with the Mutasiku API to help users monitor trans
 
 3. Configure environment variables by creating a `.env` file:
    ```env
+   # Required
    TELEGRAM_BOT_TOKEN=your_telegram_bot_token
    TELEGRAM_BOT_NAME=Your Bot Name
    MUTASIKU_API_KEY=your_mutasiku_api_key
-   DB_PATH=./data/bot.sqlite
+   DB_PATH=./database/sessions.db
+   
+   # Authentication (Required)
+   BOT_PASSWORD=your_secure_password_here
+   MAX_LOGIN_ATTEMPTS=3
+   LOGIN_TIMEOUT_MINUTES=30
    ```
 
 4. Start the bot:
@@ -50,23 +59,78 @@ A Telegram bot that integrates with the Mutasiku API to help users monitor trans
    npm start
    ```
 
+## 🔐 Authentication & Security
+
+### Password Protection
+The bot requires password authentication before any features can be accessed:
+
+1. **First Contact**: When users start the bot, they must authenticate
+2. **Login Process**: Use `/login` command to enter the secure password
+3. **Session Management**: Authenticated sessions last 24 hours
+4. **Failed Attempts**: Users are temporarily blocked after 3 failed attempts
+5. **Logout**: Users can logout anytime with `/logout`
+
+### Security Features
+- **🔑 Secure Password**: Configurable password protection for bot access
+- **⏰ Session Expiry**: Authenticated sessions automatically expire after 24 hours
+- **🚫 Attempt Limiting**: Temporary blocks after multiple failed login attempts
+- **🔒 PIN Security**: User PINs are processed securely and never stored as plaintext
+- **✅ Input Validation**: Comprehensive validation for all user inputs
+- **🛡️ Error Handling**: Robust error handling prevents data leaks
+- **🗑️ Auto Cleanup**: Expired sessions are automatically cleaned up
+
 ## 🤖 Bot Commands
 
 The bot supports the following commands:
 
-### Core Commands
-- `/start` - Start the bot and get a welcome message
+### Authentication Commands
+- `/start` - Start the bot (shows login requirement if not authenticated)
+- `/login` - Login with password to access bot features
+- `/logout` - Logout and end current session
+
+### Core Commands (Requires Authentication)
 - `/help` - Display comprehensive help information
 - `/cancel` - Cancel any ongoing process
 
-### Account Management
+### Account Management (Requires Authentication)
 - `/add` - Add a new e-wallet account (DANA, OVO, GoPay Merchant)
 - `/remove` - Remove an existing e-wallet account
 - `/accounts` - View all your connected accounts with balances
 
-### Transactions & Transfers
+### Transactions & Transfers (Requires Authentication)
 - `/mutasi` - View your recent transactions with advanced filtering
-- `/transfer` - **NEW!** Transfer money from your DANA account
+- `/transfer` - Transfer money from your DANA account
+
+## 🔐 Getting Started (Authentication Flow)
+
+### First Time Setup
+1. **Start the bot**: `/start`
+   ```
+   🔐 Akses Terbatas
+   Bot ini memerlukan autentikasi sebelum digunakan.
+   
+   🔑 Gunakan perintah /login untuk masuk.
+   ```
+
+2. **Login**: `/login`
+   ```
+   🔐 Login ke Bot
+   Silakan masukkan password:
+   ```
+
+3. **Enter Password**: Type your configured password
+   ```
+   ✅ Login berhasil!
+   Selamat datang! Gunakan /help untuk melihat perintah yang tersedia.
+   ```
+
+4. **Access Features**: Now you can use all bot features for 24 hours
+
+### Security Measures
+- **🔒 Message Deletion**: Password messages are automatically deleted for security
+- **⚠️ Attempt Counter**: Shows remaining attempts after failed logins
+- **🕐 Temporary Blocks**: 30-minute blocks after 3 failed attempts
+- **📊 Session Tracking**: All authentication attempts are logged
 
 ## 💸 Transfer Features
 
@@ -130,7 +194,15 @@ You can combine multiple filters for precise results:
 
 ## 🔄 Complete Workflows
 
-### Adding a DANA Account
+### First Time Authentication
+
+1. **Start**: `/start`
+2. **Login**: `/login`
+3. **Enter Password**: Type your bot password (message gets deleted automatically)
+4. **Success**: Now you can access all features
+5. **Help**: Use `/help` to see available commands
+
+### Adding a DANA Account (After Authentication)
 
 1. Start with `/add`
 2. Select **DANA** from the wallet options
@@ -141,7 +213,7 @@ You can combine multiple filters for precise results:
 7. Provide a custom name for your account (e.g., "DANA Utama")
 8. ✅ Account successfully added!
 
-### Making a Bank Transfer
+### Making a Bank Transfer (After Authentication)
 
 1. Use `/transfer` command
 2. Select your DANA account from the list
@@ -155,7 +227,7 @@ You can combine multiple filters for precise results:
 8. Type `KONFIRMASI` to complete transfer
 9. ✅ Transfer successful!
 
-### Paying with QRIS
+### Paying with QRIS (After Authentication)
 
 1. Use `/transfer` command
 2. Select your DANA account
@@ -170,6 +242,7 @@ You can combine multiple filters for precise results:
 ```
 ├── index.js                   # Main application entry point
 ├── lib/
+│   ├── authHandler.js         # Authentication & session management
 │   ├── walletHandlers.js      # DANA/OVO wallet operations
 │   ├── transferHandlers.js    # Bank transfer & QRIS functionality
 │   ├── accountHandler.js      # Account management functions
@@ -177,24 +250,55 @@ You can combine multiple filters for precise results:
 │   ├── utils.js               # Utility functions (currency, validation)
 │   └── logger.js              # Logging functionality
 ├── database/
-│   └── sessions.db            # SQLite database for sessions
+│   └── sessions.db            # SQLite database for sessions & auth
 └── .env                       # Environment configuration
 ```
 
+### Authentication System
+- **Password Protection**: Configurable password required for bot access
+- **Session Types**: Different session types (authenticated, login, auth_attempts)
+- **Attempt Tracking**: Failed login attempts tracked and limited
+- **Auto Expiry**: Sessions automatically expire for security
+- **Secure Storage**: Sessions stored in encrypted SQLite database
+
 ### Session Management
 - **SQLite Database**: Secure session storage with automatic cleanup
-- **15-minute Expiry**: Sessions automatically expire for security
+- **24-hour Authentication**: Authenticated sessions last 24 hours
+- **15-minute Activity**: Other sessions expire after 15 minutes
 - **State Management**: Multi-step processes handled seamlessly
 - **Concurrent Support**: Multiple users can use the bot simultaneously
 
-### Security Features
-- **🔐 PIN Security**: User PINs are processed securely and never stored as plaintext
-- **🕐 Session Expiry**: All sessions expire after 15 minutes of inactivity
-- **🔒 Secure API**: All requests to Mutasiku API use secure HTTPS channels
-- **✅ Input Validation**: Comprehensive validation for all user inputs
-- **🛡️ Error Handling**: Robust error handling prevents data leaks
+## 🛡️ Security Configuration
+
+### Environment Variables
+```env
+# Authentication Settings
+BOT_PASSWORD=your_secure_password          # Required: Bot access password
+MAX_LOGIN_ATTEMPTS=3                       # Optional: Max failed attempts (default: 3)
+LOGIN_TIMEOUT_MINUTES=30                   # Optional: Block duration (default: 30)
+
+# Bot Configuration
+TELEGRAM_BOT_TOKEN=your_bot_token          # Required: From BotFather
+MUTASIKU_API_KEY=your_api_key              # Required: From Mutasiku
+TELEGRAM_BOT_NAME=YourBotName              # Optional: Bot display name
+DB_PATH=./database/sessions.db             # Optional: Database location
+```
+
+### Security Best Practices
+- **🔑 Strong Password**: Use a strong, unique password for bot access
+- **🔄 Regular Updates**: Change the bot password regularly
+- **📊 Monitor Logs**: Check logs for unauthorized access attempts
+- **🚫 IP Restrictions**: Consider implementing IP whitelisting if needed
+- **⏰ Session Rotation**: Sessions automatically expire for security
 
 ## 🎯 User Experience Features
+
+### Authentication UX
+- **Clear Instructions**: Users know exactly what's required
+- **Attempt Counter**: Shows remaining login attempts
+- **Security Messages**: Passwords are automatically deleted
+- **Progress Feedback**: Real-time authentication status
+- **Helpful Errors**: Clear error messages with next steps
 
 ### Smart Bank Selection
 - **Instant Search**: Type bank name for immediate results
@@ -215,10 +319,11 @@ You can combine multiple filters for precise results:
 
 ## 🚀 Performance & Scalability
 
-- **Efficient Database**: SQLite for fast session management
+- **Efficient Database**: SQLite for fast session and authentication management
 - **Async Processing**: Non-blocking operations for better user experience
 - **Memory Management**: Automatic session cleanup and garbage collection
 - **Rate Limiting**: Built-in protection against spam and abuse
+- **Authentication Caching**: Efficient session validation
 
 ## 🔧 Development & Debugging
 
@@ -227,6 +332,10 @@ You can combine multiple filters for precise results:
 # Install dependencies
 npm install
 
+# Set up environment
+cp .env.example .env
+# Edit .env with your credentials
+
 # Run with auto-restart
 npm run dev
 
@@ -234,20 +343,34 @@ npm run dev
 npm test
 ```
 
+### Authentication Testing
+```bash
+# Test authentication flow
+1. Start bot: /start
+2. Login: /login
+3. Enter test password
+4. Verify access to protected commands
+5. Test logout: /logout
+```
+
 ### Environment Variables
 ```env
 # Required
 TELEGRAM_BOT_TOKEN=your_bot_token_from_botfather
 MUTASIKU_API_KEY=your_mutasiku_api_key
+BOT_PASSWORD=your_secure_password
 
 # Optional
 TELEGRAM_BOT_NAME=YourBotName
-DB_PATH=./data/bot.sqlite
+DB_PATH=./database/sessions.db
+MAX_LOGIN_ATTEMPTS=3
+LOGIN_TIMEOUT_MINUTES=30
 LOG_LEVEL=info
 ```
 
 ### Logging
 The bot includes comprehensive logging for monitoring and debugging:
+- **Authentication**: All login attempts and security events
 - **Info Level**: User actions and successful operations
 - **Error Level**: Failures and exceptions with stack traces
 - **Debug Level**: Detailed information for troubleshooting
@@ -264,11 +387,10 @@ This bot integrates with the [Mutasiku SDK](https://www.npmjs.com/package/mutasi
 
 ## 🔄 Future Roadmap
 
-- [ ] **Multi-language Support**: Indonesian and English
+- [ ] **Two-Factor Authentication**: Enhanced security with 2FA
+- [ ] **Role-based Access**: Different permission levels
 - [ ] **Scheduled Transfers**: Set up recurring payments
-- [ ] **Transfer History**: Detailed transfer tracking
 - [ ] **Budget Alerts**: Set spending limits and notifications
-- [ ] **Group Features**: Shared expense tracking
 - [ ] **Webhook Notifications**: Real-time transaction alerts
 
 ## 🤝 Contributing
@@ -301,6 +423,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 📈 Statistics
 
+- **🔐 Security**: Password-protected access
 - **🏦 Supported Banks**: 136+ Indonesian banks
 - **💱 E-wallets**: 3 major providers (DANA, OVO, GoPay)
 - **🚀 Response Time**: Sub-second API responses
