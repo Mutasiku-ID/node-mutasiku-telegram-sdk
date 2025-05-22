@@ -14,13 +14,19 @@ import {
   completeDANASetup 
 } from './lib/walletHandlers.js';
 import { 
+  handleDANABankTransferInit, 
+  completeDANABankTransfer, 
+  handleDANAQRISTransfer 
+} from './lib/transferHandlers.js';
+import { 
   getMutasiForUser, 
   getAccountsForUser, 
   removeAccountForUser 
 } from './lib/accountHandler.js';
 import {
   isValidPhoneNumber,
-  formatPhoneNumber
+  formatPhoneNumber,
+  formatCurrency
 } from './lib/utils.js';
 import { 
   updateSessionData, 
@@ -291,30 +297,32 @@ function setupBotCommands(bot, sdk, sessionManager) {
 
   // Help command
   bot.help((ctx) => {
-    ctx.reply(`Bantuan ${TELEGRAM_BOT_NAME}:\n
-  /start - Mulai bot
-  /add - Tambahkan akun e-wallet baru
-  /remove - Hapus akun e-wallet yang ada
-  /accounts - Lihat semua akun Anda
+    ctx.reply(`Bantuan ${TELEGRAM_BOT_NAME}:
+
+/start - Mulai bot
+/add - Tambahkan akun e-wallet baru
+/remove - Hapus akun e-wallet yang ada
+/accounts - Lihat semua akun Anda
+/transfer - Transfer dana dari akun DANA Anda
+
+/mutasi - Lihat transaksi terbaru Anda
+  Filter dasar:
+  • /mutasi limit 10 - Tampilkan 10 transaksi
+  • /mutasi days 30 - Tampilkan transaksi dari 30 hari terakhir
+  • /mutasi page 2 - Beralih ke halaman hasil berikutnya
   
-  /mutasi - Lihat transaksi terbaru Anda
-    Filter dasar:
-    • /mutasi limit 10 - Tampilkan 10 transaksi
-    • /mutasi days 30 - Tampilkan transaksi dari 30 hari terakhir
-    • /mutasi page 2 - Beralih ke halaman hasil berikutnya
-    
-    Filter lanjutan:
-    • /mutasi type credit - Hanya tampilkan uang masuk
-    • /mutasi type debit - Hanya tampilkan uang keluar
-    • /mutasi provider dana - Filter berdasarkan kode penyedia
-    • /mutasi account [ID] - Tampilkan transaksi untuk akun tertentu
-    • /mutasi min 1000000 - Filter jumlah minimum
-    • /mutasi max 5000000 - Filter jumlah maksimum
-    • /mutasi search "gojek" - Cari teks tertentu
-  
-    Anda dapat menggabungkan filter: /mutasi days 30 type credit min 500000
-  
-  /help - Tampilkan pesan bantuan ini`);
+  Filter lanjutan:
+  • /mutasi type credit - Hanya tampilkan uang masuk
+  • /mutasi type debit - Hanya tampilkan uang keluar
+  • /mutasi provider dana - Filter berdasarkan kode penyedia
+  • /mutasi account [ID] - Tampilkan transaksi untuk akun tertentu
+  • /mutasi min 1000000 - Filter jumlah minimum
+  • /mutasi max 5000000 - Filter jumlah maksimum
+  • /mutasi search "transfer" - Cari teks tertentu
+
+Anda dapat menggabungkan filter: /mutasi days 30 type credit min 500000
+
+/help - Tampilkan pesan bantuan ini`);
   });
 
   // Mutasi command
@@ -329,6 +337,9 @@ function setupBotCommands(bot, sdk, sessionManager) {
   // Add command
   bot.command('add', async (ctx) => handleAddCommand(ctx, sessionManager));
   
+  // Transfer command
+  bot.command('transfer', async (ctx) => handleTransferCommand(ctx, sdk, sessionManager));
+  
   // Cancel command
   bot.command('cancel', async (ctx) => {
     const chatId = ctx.chat?.id.toString();
@@ -338,7 +349,7 @@ function setupBotCommands(bot, sdk, sessionManager) {
     const session = await getSessionData(chatId, sessionManager);
     if (session) {
       await deleteSessionData(session.id, sessionManager);
-      await ctx.reply('Tindakan dibatalkan. Ketik /add untuk memulai kembali.');
+      await ctx.reply('Tindakan dibatalkan. Ketik /add atau /transfer untuk memulai kembali.');
     } else {
       await ctx.reply('Tidak ada tindakan yang sedang berlangsung.');
     }
@@ -349,6 +360,94 @@ function setupBotCommands(bot, sdk, sessionManager) {
   
   // Text message handler
   setupTextMessageHandler(bot, sessionManager, sdk);
+}
+
+/**
+ * Handle transfer command
+ */
+async function handleTransferCommand(ctx, sdk, sessionManager) {
+  const chatId = ctx.chat?.id.toString();
+  if (!chatId) {
+    logger.error('telegram.transfer', 'No chat context found');
+    return;
+  }
+
+  try {
+    // Check for existing session
+    const existingSession = await getSessionData(chatId, sessionManager);
+    if (existingSession) {
+      await ctx.reply('Anda memiliki proses yang sedang berlangsung. Silakan selesaikan atau ketik /cancel untuk membatalkan.');
+      return;
+    }
+
+    // Show loading message
+    const loadingMsg = await ctx.reply('Memuat akun DANA Anda... 🔄');
+
+    try {
+      // Get user's DANA accounts
+      const accountsResponse = await sdk.getAccounts();
+      
+      if (accountsResponse.status !== 'success' || !accountsResponse.data) {
+        await ctx.telegram.editMessageText(
+          chatId,
+          loadingMsg.message_id,
+          undefined,
+          '❌ Gagal mengambil daftar akun. Silakan coba lagi nanti.'
+        );
+        return;
+      }
+
+      // Filter only active DANA accounts
+      const danaAccounts = accountsResponse.data.filter(
+        account => account.type === 'ewallet' && 
+                  account.isActive === true && 
+                  account.provider.code === 'DANA'
+      );
+
+      if (danaAccounts.length === 0) {
+        await ctx.telegram.editMessageText(
+          chatId,
+          loadingMsg.message_id,
+          undefined,
+          'Anda tidak memiliki akun DANA aktif. Gunakan /add untuk menambahkan akun DANA terlebih dahulu.'
+        );
+        return;
+      }
+
+      // Create keyboard for account selection
+      const keyboard = danaAccounts.map((account) => [
+        { 
+          text: `${account.phoneNumber} - ${account.name} - ${formatCurrency(account.balance)}`, 
+          callback_data: `transfer_account:${account.id}` 
+        }
+      ]);
+      
+      keyboard.push([{ text: 'Batal', callback_data: 'cancel_transfer' }]);
+
+      await ctx.telegram.editMessageText(
+        chatId,
+        loadingMsg.message_id,
+        undefined,
+        'Pilih akun DANA untuk transfer:',
+        {
+          reply_markup: {
+            inline_keyboard: keyboard
+          }
+        }
+      );
+    } catch (error) {
+      logger.error('telegram.transfer', 'Error in transfer command', { error });
+      await ctx.telegram.editMessageText(
+        chatId,
+        loadingMsg.message_id,
+        undefined,
+        '❌ Gagal memuat akun. Silakan coba lagi nanti.'
+      );
+    }
+  } catch (error) {
+    logger.error('telegram.transfer', 'Error preparing transfer command', { error });
+    await ctx.reply('Gagal mempersiapkan transfer. Silakan coba lagi nanti.');
+  }
 }
 
 /**
@@ -584,7 +683,7 @@ async function handleRemoveCommand(ctx, sdk) {
       // Create keyboard
       const keyboard = walletAccounts.map((account) => [
         { 
-          text: `${account.name} (${account.provider.name || account.provider.code || 'Unknown'})`, 
+          text: `${account.accountName} (${account.provider.name || account.provider.code || 'Unknown'})`, 
           callback_data: `remove:${account.id}` 
         }
       ]);
@@ -683,8 +782,208 @@ async function handleAddCommand(ctx, sessionManager) {
 }
 
 /**
- * Set up all callback actions
+ * Handle bank transfer amount input with improved UX
  */
+async function handleBankAmountInput(ctx, session, sdk, sessionManager) {
+  if (!ctx.message?.text) {
+    return await ctx.reply('Input tidak valid. Silakan masukkan jumlah yang valid.');
+  }
+
+  const amountText = ctx.message.text.trim().replace(/[.,]/g, '');
+  const amount = parseInt(amountText);
+
+  if (isNaN(amount) || amount < 10000) {
+    return await ctx.reply('Jumlah tidak valid. Minimum transfer ke bank adalah Rp 10.000.\n\nSilakan masukkan jumlah yang valid:');
+  }
+
+  const loadingMsg = await ctx.reply('Memuat daftar bank... 🔄');
+
+  try {
+    const banksResponse = await sdk.getDanaBanks(session.data.accountId);
+    
+    if (!banksResponse.success || !Array.isArray(banksResponse.data) || banksResponse.data.length === 0) {
+      await ctx.telegram.editMessageText(
+        ctx.chat.id,
+        loadingMsg.message_id,
+        undefined,
+        '❌ Gagal memuat daftar bank. Silakan coba lagi nanti.'
+      );
+      return;
+    }
+
+    // Update session with amount and banks
+    await updateSessionData(session, sessionManager, {
+      state: 'selecting_bank_method',
+      data: { 
+        amount,
+        availableBanks: banksResponse.data 
+      }
+    });
+
+    // Show bank selection options
+    const selectionKeyboard = [
+      [{ text: '🔍 Cari Bank', callback_data: 'search_bank' }],
+      [{ text: '⭐ Bank Populer', callback_data: 'popular_banks' }],
+      [{ text: '📋 Semua Bank (A-Z)', callback_data: 'all_banks_az' }],
+      [{ text: '❌ Batal', callback_data: 'cancel_transfer' }]
+    ];
+
+    await ctx.telegram.editMessageText(
+      ctx.chat.id,
+      loadingMsg.message_id,
+      undefined,
+      `💰 <b>Jumlah transfer: ${formatCurrency(amount)}</b>\n\n🏦 <b>Cara pilih bank tujuan:</b>\n\n🔍 <b>Cari Bank</b> - Ketik nama bank\n⭐ <b>Bank Populer</b> - 10 bank utama\n📋 <b>Semua Bank</b> - Daftar lengkap (${banksResponse.data.length} bank)`,
+      {
+        reply_markup: {
+          inline_keyboard: selectionKeyboard
+        },
+        parse_mode: 'HTML'
+      }
+    );
+  } catch (error) {
+    logger.error('telegram.transfer.amount', 'Error processing amount', { error });
+    await ctx.telegram.editMessageText(
+      ctx.chat.id,
+      loadingMsg.message_id,
+      undefined,
+      '❌ Gagal memproses jumlah. Silakan coba lagi nanti.'
+    );
+  }
+}
+
+/**
+ * Bank search handler
+ */
+async function handleBankSearch(ctx, session, sessionManager) {
+  if (!ctx.message?.text) {
+    return await ctx.reply('Silakan ketik nama bank yang ingin dicari.');
+  }
+
+  const searchTerm = ctx.message.text.trim().toLowerCase();
+  
+  if (searchTerm.length < 2) {
+    return await ctx.reply('Ketik minimal 2 karakter untuk mencari bank.\n\nContoh: BCA, Mandiri, BNI');
+  }
+
+  const allBanks = session.data.availableBanks;
+  
+  // Search banks by name
+  const matchingBanks = allBanks.filter(bank => {
+    const bankName = (bank.name || bank.instLocalName).toLowerCase();
+    return bankName.includes(searchTerm) || 
+           bank.instId.toLowerCase().includes(searchTerm);
+  });
+
+  if (matchingBanks.length === 0) {
+    return await ctx.reply(
+      `❌ Tidak ditemukan bank dengan kata kunci: "<b>${ctx.message.text}</b>"\n\n💡 Coba kata kunci lain:\n• BCA\n• Mandiri\n• BNI\n• BRI\n• CIMB\n\nAtau ketik /cancel untuk membatalkan.`,
+     { parse_mode: 'HTML' }
+   );
+  }
+
+  if (matchingBanks.length === 1) {
+    // Only one match, select it automatically
+    const bankData = matchingBanks[0];
+    
+    await updateSessionData(session, sessionManager, {
+      state: 'awaiting_account_number',
+      data: { bankData }
+    });
+
+    const bankName = bankData.name || bankData.instLocalName;
+    const transferAmount = formatCurrency(session.data.amount);
+
+    await ctx.reply(
+      `✅ <b>Bank ditemukan: ${bankName}</b>\n💰 <b>Jumlah: ${transferAmount}</b>\n\n📝 Silakan masukkan nomor rekening tujuan (8-20 digit):`,
+      { parse_mode: 'HTML' }
+    );
+  } else {
+    // Multiple matches, show selection
+    const bankKeyboard = matchingBanks.slice(0, 10).map((bank) => [
+      { 
+        text: `${bank.name || bank.instLocalName}`, 
+        callback_data: `select_bank:${allBanks.indexOf(bank)}`
+      }
+    ]);
+    
+    if (matchingBanks.length > 10) {
+      bankKeyboard.push([{ 
+        text: `➡️ Lihat ${matchingBanks.length - 10} bank lainnya`, 
+        callback_data: 'more_search_results' 
+      }]);
+    }
+    
+    bankKeyboard.push([{ text: '🔍 Cari Lagi', callback_data: 'search_bank' }]);
+    bankKeyboard.push([{ text: '❌ Batal', callback_data: 'cancel_transfer' }]);
+
+    const transferAmount = formatCurrency(session.data.amount);
+
+    await ctx.reply(
+      `🔍 <b>Hasil pencarian "${ctx.message.text}":</b>\n💰 <b>Jumlah: ${transferAmount}</b>\n\nDitemukan ${matchingBanks.length} bank:`,
+      {
+        reply_markup: {
+          inline_keyboard: bankKeyboard
+        },
+        parse_mode: 'HTML'
+      }
+    );
+
+    // Update session with search results
+    await updateSessionData(session, sessionManager, {
+      data: { searchResults: matchingBanks }
+    });
+  }
+}
+
+/**
+* Helper function for bank pagination
+*/
+function showBankPage(ctx, session, banks, page) {
+  const BANKS_PER_PAGE = 15;
+  const startIndex = page * BANKS_PER_PAGE;
+  const endIndex = Math.min(startIndex + BANKS_PER_PAGE, banks.length);
+  const banksOnPage = banks.slice(startIndex, endIndex);
+  
+  const bankKeyboard = banksOnPage.map((bank, index) => [
+    { 
+      text: `${bank.name || bank.instLocalName}`, 
+      callback_data: `select_bank:${session.data.availableBanks.indexOf(bank)}`
+    }
+  ]);
+  
+  // Navigation buttons
+  const navButtons = [];
+  if (page > 0) {
+    navButtons.push({ text: '⬅️ Sebelumnya', callback_data: `bank_page:${page - 1}` });
+  }
+  if (endIndex < banks.length) {
+    navButtons.push({ text: 'Selanjutnya ➡️', callback_data: `bank_page:${page + 1}` });
+  }
+  
+  if (navButtons.length > 0) {
+    bankKeyboard.push(navButtons);
+  }
+  
+  bankKeyboard.push([{ text: '🔍 Cari Bank', callback_data: 'search_bank' }]);
+  bankKeyboard.push([{ text: '❌ Batal', callback_data: 'cancel_transfer' }]);
+
+  const transferAmount = formatCurrency(session.data.amount);
+  const totalPages = Math.ceil(banks.length / BANKS_PER_PAGE);
+
+  ctx.editMessageText(
+    `💰 <b>Jumlah transfer: ${transferAmount}</b>\n\n📋 <b>Semua Bank (A-Z)</b>\nHalaman ${page + 1} dari ${totalPages} • Bank ${startIndex + 1}-${endIndex} dari ${banks.length}`,
+    {
+      reply_markup: {
+        inline_keyboard: bankKeyboard
+      },
+      parse_mode: 'HTML'
+    }
+  );
+}
+
+/**
+* Set up all callback actions
+*/
 function setupCallbackActions(bot, sdk, sessionManager) {
   // Handle cancel button
   bot.action('cancel_remove', async (ctx) => {
@@ -748,6 +1047,317 @@ function setupCallbackActions(bot, sdk, sessionManager) {
       logger.error('telegram.remove', 'Error in confirm handler', { error });
       await ctx.editMessageText('❌ Error menghapus akun. Silakan coba lagi nanti.');
     }
+  });
+
+  // Handle transfer account selection
+  bot.action(/^transfer_account:(.+)$/, async (ctx) => {
+    const accountId = ctx.match[1];
+    const chatId = ctx.callbackQuery?.message?.chat.id.toString();
+    
+    if (!chatId) {
+      await ctx.answerCbQuery('Error: Tidak dapat memproses permintaan');
+      return;
+    }
+
+    try {
+      await ctx.answerCbQuery();
+      
+      // Create session for transfer
+      const session = await createSessionData(chatId, 'dana_transfer', { 
+        accountId 
+      }, sessionManager);
+
+      // Update session state
+      await updateSessionData(session, sessionManager, {
+        state: 'select_transfer_type'
+      });
+
+      // Show transfer type options
+      const transferKeyboard = [
+        [{ text: '🏦 Transfer ke Bank', callback_data: 'transfer_type:bank' }],
+        [{ text: '📱 Bayar QRIS', callback_data: 'transfer_type:qris' }],
+        [{ text: 'Batal', callback_data: 'cancel_transfer' }]
+      ];
+
+      await ctx.editMessageText(
+        'Pilih jenis transfer:',
+        {
+          reply_markup: {
+            inline_keyboard: transferKeyboard
+          }
+        }
+      );
+    } catch (error) {
+      logger.error('telegram.transfer.account', 'Error selecting account', { error });
+      await ctx.answerCbQuery('Gagal memproses pilihan');
+    }
+  });
+
+  // Handle transfer type selection
+  bot.action(/^transfer_type:(.+)$/, async (ctx) => {
+    const transferType = ctx.match[1]; // 'bank' or 'qris'
+    const chatId = ctx.callbackQuery?.message?.chat.id.toString();
+    
+    if (!chatId) {
+      await ctx.answerCbQuery('Error: Tidak dapat memproses permintaan');
+      return;
+    }
+
+    try {
+      await ctx.answerCbQuery();
+      
+      // Get current session
+      const session = await getSessionData(chatId, sessionManager);
+      if (!session) {
+        await ctx.editMessageText('Sesi tidak valid. Silakan mulai kembali dengan /transfer.');
+        return;
+      }
+
+      if (transferType === 'bank') {
+        // Bank transfer flow
+        await ctx.editMessageText('Silakan masukkan jumlah yang ingin ditransfer (minimum Rp 10.000):');
+        
+        await updateSessionData(session, sessionManager, {
+          state: 'awaiting_bank_amount',
+          data: { transferType: 'bank' }
+        });
+      } else if (transferType === 'qris') {
+        // QRIS transfer flow
+        await ctx.editMessageText('Silakan masukkan jumlah untuk pembayaran QRIS (minimum Rp 1.000):');
+        
+        await updateSessionData(session, sessionManager, {
+          state: 'awaiting_qris_amount',
+          data: { transferType: 'qris' }
+        });
+      }
+    } catch (error) {
+      logger.error('telegram.transfer.type', 'Error selecting transfer type', { error });
+      await ctx.answerCbQuery('Gagal memproses pilihan');
+    }
+  });
+
+  // Handle search bank option
+  bot.action('search_bank', async (ctx) => {
+    const chatId = ctx.callbackQuery?.message?.chat.id.toString();
+    
+    if (!chatId) {
+      await ctx.answerCbQuery('Error: Tidak dapat memproses permintaan');
+      return;
+    }
+
+    try {
+      await ctx.answerCbQuery();
+      
+      // Get current session
+      const session = await getSessionData(chatId, sessionManager);
+      if (!session) {
+        await ctx.editMessageText('Sesi tidak valid. Silakan mulai kembali dengan /transfer.');
+        return;
+      }
+
+      // Update session state to search mode
+      await updateSessionData(session, sessionManager, {
+        state: 'searching_bank'
+      });
+
+      const transferAmount = formatCurrency(session.data.amount);
+
+      await ctx.editMessageText(
+        `💰 <b>Jumlah transfer: ${transferAmount}</b>\n\n🔍 <b>Cari Bank</b>\n\nKetik nama bank yang ingin Anda cari:\n\nContoh:\n• BCA\n• Mandiri\n• BNI\n• BRI\n\nAtau ketik /cancel untuk membatalkan.`,
+        { parse_mode: 'HTML' }
+      );
+    } catch (error) {
+      logger.error('telegram.search_bank', 'Error in search bank', { error });
+      await ctx.answerCbQuery('Gagal memulai pencarian');
+    }
+  });
+
+  // Handle popular banks
+  bot.action('popular_banks', async (ctx) => {
+    const chatId = ctx.callbackQuery?.message?.chat.id.toString();
+    
+    if (!chatId) {
+      await ctx.answerCbQuery('Error: Tidak dapat memproses permintaan');
+      return;
+    }
+
+    try {
+      await ctx.answerCbQuery();
+      
+      const session = await getSessionData(chatId, sessionManager);
+      if (!session || !session.data.availableBanks) {
+        await ctx.editMessageText('Sesi tidak valid. Silakan mulai kembali dengan /transfer.');
+        return;
+      }
+
+      // Define popular banks by instId
+      const popularBankIds = [
+        'BCAC1ID', 'MDRIC1ID', 'BNIC1ID', 'BRIC1ID', 'CITIC1ID',
+        'MABKC1ID', 'PANIC1ID', 'BNLIC1ID', 'DBSC1ID', 'UOBC1ID'
+      ];
+
+      const allBanks = session.data.availableBanks;
+      const popularBanks = popularBankIds
+        .map(id => allBanks.find(bank => bank.instId === id))
+        .filter(bank => bank !== undefined);
+
+      const bankKeyboard = popularBanks.map((bank, index) => [
+        { 
+          text: `${bank.name || bank.instLocalName}`, 
+          callback_data: `select_bank:${allBanks.indexOf(bank)}`
+        }
+      ]);
+      
+      bankKeyboard.push([{ text: '🔍 Cari Bank Lain', callback_data: 'search_bank' }]);
+      bankKeyboard.push([{ text: '📋 Semua Bank', callback_data: 'all_banks_az' }]);
+      bankKeyboard.push([{ text: '❌ Batal', callback_data: 'cancel_transfer' }]);
+
+      const transferAmount = formatCurrency(session.data.amount);
+
+      await ctx.editMessageText(
+        `💰 <b>Jumlah transfer: ${transferAmount}</b>\n\n⭐ <b>Bank Populer:</b>`,
+        {
+          reply_markup: {
+            inline_keyboard: bankKeyboard
+          },
+          parse_mode: 'HTML'
+        }
+      );
+    } catch (error) {
+      logger.error('telegram.popular_banks', 'Error showing popular banks', { error });
+      await ctx.answerCbQuery('Gagal memuat bank populer');
+    }
+  });
+
+  // Handle all banks A-Z
+  bot.action('all_banks_az', async (ctx) => {
+    const chatId = ctx.callbackQuery?.message?.chat.id.toString();
+    
+    if (!chatId) {
+      await ctx.answerCbQuery('Error: Tidak dapat memproses permintaan');
+      return;
+    }
+
+    try {
+      await ctx.answerCbQuery();
+      
+      const session = await getSessionData(chatId, sessionManager);
+      if (!session || !session.data.availableBanks) {
+        await ctx.editMessageText('Sesi tidak valid. Silakan mulai kembali dengan /transfer.');
+        return;
+      }
+
+      // Sort banks alphabetically and show first 15
+      const allBanks = [...session.data.availableBanks].sort((a, b) => 
+        (a.name || a.instLocalName).localeCompare(b.name || b.instLocalName)
+      );
+
+      await updateSessionData(session, sessionManager, {
+        data: { 
+          sortedBanks: allBanks,
+          currentPage: 0
+        }
+      });
+
+      showBankPage(ctx, session, allBanks, 0);
+    } catch (error) {
+      logger.error('telegram.all_banks', 'Error showing all banks', { error });
+      await ctx.answerCbQuery('Gagal memuat semua bank');
+    }
+  });
+
+  // Handle bank page navigation
+  bot.action(/^bank_page:(\d+)$/, async (ctx) => {
+    const page = parseInt(ctx.match[1]);
+    const chatId = ctx.callbackQuery?.message?.chat.id.toString();
+    
+    if (!chatId) {
+      await ctx.answerCbQuery('Error: Tidak dapat memproses permintaan');
+      return;
+    }
+
+    try {
+      await ctx.answerCbQuery();
+      
+      const session = await getSessionData(chatId, sessionManager);
+      if (!session || !session.data.sortedBanks) {
+        await ctx.editMessageText('Sesi tidak valid. Silakan mulai kembali dengan /transfer.');
+        return;
+      }
+
+      await updateSessionData(session, sessionManager, {
+        data: { currentPage: page }
+      });
+
+      showBankPage(ctx, session, session.data.sortedBanks, page);
+    } catch (error) {
+      logger.error('telegram.bank_page', 'Error navigating bank page', { error });
+      await ctx.answerCbQuery('Gagal memuat halaman');
+    }
+  });
+
+  // Handle bank selection
+  bot.action(/^select_bank:(\d+)$/, async (ctx) => {
+    const chatId = ctx.callbackQuery?.message?.chat.id.toString();
+    
+    if (!chatId) {
+      await ctx.answerCbQuery('Error: Tidak dapat memproses permintaan');
+      return;
+    }
+
+    try {
+      const bankIndex = parseInt(ctx.match[1]);
+      await ctx.answerCbQuery();
+      
+      // Get current session
+      const session = await getSessionData(chatId, sessionManager);
+      if (!session) {
+        await ctx.editMessageText('Sesi tidak valid. Silakan mulai kembali dengan /transfer.');
+        return;
+      }
+
+      // Get bank data from session
+      const availableBanks = session.data.availableBanks;
+      if (!availableBanks || !Array.isArray(availableBanks) || bankIndex >= availableBanks.length) {
+        await ctx.editMessageText('Data bank tidak valid. Silakan mulai kembali dengan /transfer.');
+        return;
+      }
+
+      const bankData = availableBanks[bankIndex];
+      
+      // Update session with bank data
+      await updateSessionData(session, sessionManager, {
+        state: 'awaiting_account_number',
+        data: { bankData }
+      });
+
+      const bankName = bankData.name || bankData.instLocalName;
+      const transferAmount = formatCurrency(session.data.amount);
+
+      await ctx.editMessageText(
+        `✅ <b>Bank dipilih: ${bankName}</b>\n💰 <b>Jumlah: ${transferAmount}</b>\n\n📝 Silakan masukkan nomor rekening tujuan (8-20 digit):`,
+        { parse_mode: 'HTML' }
+      );
+    } catch (error) {
+      logger.error('telegram.transfer.bank', 'Error selecting bank', { error });
+      await ctx.answerCbQuery('Gagal memproses pilihan bank');
+      await ctx.editMessageText('❌ Gagal memproses pilihan bank. Silakan coba lagi.');
+    }
+  });
+
+  // Handle cancel transfer
+  bot.action('cancel_transfer', async (ctx) => {
+    const chatId = ctx.callbackQuery?.message?.chat.id.toString();
+    
+    if (chatId) {
+      const session = await getSessionData(chatId, sessionManager);
+      if (session) {
+        await deleteSessionData(session.id, sessionManager);
+      }
+    }
+    
+    await ctx.answerCbQuery('Transfer dibatalkan');
+    await ctx.editMessageText('Transfer dibatalkan. Gunakan /transfer untuk memulai kembali.');
   });
 
   // Handle wallet selection
@@ -874,8 +1484,8 @@ function setupCallbackActions(bot, sdk, sessionManager) {
 }
 
 /**
- * Set up text message handler
- */
+* Set up text message handler
+*/
 function setupTextMessageHandler(bot, sessionManager, sdk) {
   bot.on('text', async (ctx) => {
     // Skip processing for commands
@@ -903,13 +1513,67 @@ function setupTextMessageHandler(bot, sessionManager, sdk) {
       case 'awaiting_name':
         await handleNameInput(ctx, session, sdk, sessionManager);
         break;
+      case 'awaiting_bank_amount':
+        await handleBankAmountInput(ctx, session, sdk, sessionManager);
+        break;
+      case 'awaiting_qris_amount':
+        await handleQRISAmountInput(ctx, session, sessionManager);
+        break;
+      case 'awaiting_account_number':
+        await handleAccountNumberInput(ctx, session, sdk, sessionManager);
+        break;
+      case 'awaiting_transfer_confirmation':
+        await handleTransferConfirmation(ctx, session, sdk, sessionManager);
+        break;
+      case 'searching_bank':
+        await handleBankSearch(ctx, session, sessionManager);
+        break;
+    }
+  });
+
+  // Handle photo messages for QRIS
+  bot.on('photo', async (ctx) => {
+    const chatId = ctx.chat?.id.toString();
+    if (!chatId) return;
+
+    const session = await getSessionData(chatId, sessionManager);
+    if (!session || session.state !== 'awaiting_qris_photo') return;
+
+    // Send a new status message instead of trying to edit
+    const statusMsg = await ctx.reply('📱 Memproses QR code... Mohon tunggu.');
+
+    try {
+      // Get the largest photo for better quality
+      const photos = ctx.message.photo;
+      const largestPhoto = photos[photos.length - 1];
+      
+      await handleDANAQRISTransfer(ctx, session, largestPhoto.file_id, statusMsg, sdk, sessionManager);
+    } catch (error) {
+      logger.error('telegram.qris', 'Error processing QRIS photo', { error });
+      
+      // More specific error messages
+      let errorMessage = `❌ Error: ${error instanceof Error ? error.message : 'Gagal memproses QR code.'}`;
+      
+      if (error.message.includes('decode')) {
+        errorMessage += '\n\n💡 Tips:\n• Pastikan gambar QR code jelas\n• Coba foto ulang dengan pencahayaan yang baik\n• QR code harus terlihat utuh dalam foto';
+      } else if (error.message.includes('network') || error.message.includes('fetch')) {
+        errorMessage += '\n\n💡 Coba lagi dalam beberapa saat.';
+      }
+      
+      await ctx.telegram.editMessageText(
+        chatId,
+        statusMsg.message_id,
+        undefined,
+        errorMessage
+      );
+      await deleteSessionData(session.id, sessionManager);
     }
   });
 }
 
 /**
- * Handle phone input during session
- */
+* Handle phone input during session
+*/
 async function handlePhoneInput(ctx, session, sessionManager) {
   if (!ctx.message?.text) {
     return await ctx.reply('Input tidak valid. Silakan masukkan nomor telepon yang valid.');
@@ -945,8 +1609,8 @@ async function handlePhoneInput(ctx, session, sessionManager) {
 }
 
 /**
- * Handle PIN input during session
- */
+* Handle PIN input during session
+*/
 async function handlePinInput(ctx, session, sessionManager) {
   if (!ctx.message?.text) {
     return await ctx.reply('Input tidak valid. Silakan masukkan PIN yang valid.');
@@ -989,8 +1653,8 @@ async function handlePinInput(ctx, session, sessionManager) {
 }
 
 /**
- * Handle OTP input during session
- */
+* Handle OTP input during session
+*/
 async function handleOtpInput(ctx, session, sdk, sessionManager) {
   if (!ctx.message?.text) {
     return await ctx.reply('Input tidak valid. Silakan masukkan OTP yang valid.');
@@ -1033,8 +1697,8 @@ async function handleOtpInput(ctx, session, sdk, sessionManager) {
 }
 
 /**
- * Handle account name input during session
- */
+* Handle account name input during session
+*/
 async function handleNameInput(ctx, session, sdk, sessionManager) {
   if (!ctx.message?.text) {
     return await ctx.reply('Input tidak valid. Silakan masukkan nama akun yang valid.');
@@ -1083,20 +1747,132 @@ async function handleNameInput(ctx, session, sdk, sessionManager) {
 }
 
 /**
- * Setup graceful shutdown handlers
+* Handle QRIS amount input
+*/
+async function handleQRISAmountInput(ctx, session, sessionManager) {
+  if (!ctx.message?.text) {
+    return await ctx.reply('Input tidak valid. Silakan masukkan jumlah yang valid.');
+  }
+
+  const amountText = ctx.message.text.trim().replace(/[.,]/g, '');
+  const amount = parseInt(amountText);
+
+  if (isNaN(amount) || amount < 1000) {
+    return await ctx.reply('Jumlah tidak valid. Minimum pembayaran QRIS adalah Rp 1.000.\n\nSilakan masukkan jumlah yang valid:');
+  }
+
+  // Update session with amount
+  await updateSessionData(session, sessionManager, {
+    state: 'awaiting_qris_photo',
+    data: { amount }
+  });
+
+  await ctx.reply(`Jumlah pembayaran: ${formatCurrency(amount)}\n\nSekarang kirimkan foto QR code yang ingin dibayar:`);
+}
+
+/**
+ * Handle account number input
  */
+async function handleAccountNumberInput(ctx, session, sdk, sessionManager) {
+  if (!ctx.message?.text) {
+    return await ctx.reply('Input tidak valid. Silakan masukkan nomor rekening yang valid.');
+  }
+
+  const accountNumber = ctx.message.text.trim();
+
+  // Enhanced validation for account number
+  if (!/^\d{8,20}$/.test(accountNumber)) {
+    return await ctx.reply('❌ Format nomor rekening tidak valid.\n\n📝 Silakan masukkan nomor rekening yang benar:\n• Hanya angka (tanpa spasi atau tanda baca)\n• Panjang 8-20 digit\n\nContoh: 1234567890');
+  }
+
+  // Update session with account number and capture the updated session
+  const updatedSession = await updateSessionData(session, sessionManager, {
+    data: { accountNumber }
+  });
+
+  const bankName = updatedSession.data.bankData?.name || updatedSession.data.bankData?.instLocalName;
+  const statusMsg = await ctx.reply(`🔍 Memverifikasi rekening ${bankName}...\nMohon tunggu sebentar.`);
+
+  try {
+    await handleDANABankTransferInit(ctx, updatedSession, statusMsg, sdk, sessionManager);
+  } catch (error) {
+    logger.error('telegram.transfer.account', 'Error verifying account', { error });
+    
+    let errorMessage = `❌ Error: ${error instanceof Error ? error.message : 'Gagal memverifikasi rekening.'}`;
+    
+    // Add helpful suggestions based on error type
+    if (error.message.includes('Invalid account number')) {
+      errorMessage += '\n\n💡 Tips:\n• Pastikan nomor rekening benar\n• Coba tanpa angka 0 di depan\n• Hubungi bank untuk memastikan nomor rekening';
+    }
+    
+    await ctx.telegram.editMessageText(
+      ctx.chat.id,
+      statusMsg.message_id,
+      undefined,
+      errorMessage
+    );
+    await deleteSessionData(updatedSession.id, sessionManager);
+  }
+}
+
+/**
+* Handle transfer confirmation
+*/
+async function handleTransferConfirmation(ctx, session, sdk, sessionManager) {
+  if (!ctx.message?.text) {
+    return await ctx.reply('Silakan ketik KONFIRMASI untuk melanjutkan atau BATAL untuk membatalkan.');
+  }
+
+  const confirmation = ctx.message.text.trim().toUpperCase();
+
+  if (confirmation === 'KONFIRMASI') {
+    const statusMsg = await ctx.reply('⏳ Memproses transfer... Mohon tunggu.\n\n⚠️ Jangan tutup aplikasi atau kirim pesan lain sampai proses selesai.');
+
+    try {
+      await completeDANABankTransfer(ctx, session, statusMsg, sdk, sessionManager);
+    } catch (error) {
+      logger.error('telegram.transfer.confirm', 'Error completing transfer', { error });
+      
+      let errorMessage = `❌ Transfer gagal: ${error instanceof Error ? error.message : 'Gagal menyelesaikan transfer.'}`;
+      
+      // Add specific help for common errors
+      if (error.message.includes('Insufficient balance')) {
+        errorMessage += '\n\n💡 Silakan cek saldo DANA Anda dan coba lagi dengan jumlah yang lebih kecil.';
+      } else if (error.message.includes('Daily limit')) {
+        errorMessage += '\n\n💡 Anda mungkin telah mencapai batas transfer harian. Coba lagi besok.';
+      }
+      
+      await ctx.telegram.editMessageText(
+        ctx.chat.id,
+        statusMsg.message_id,
+        undefined,
+        errorMessage
+      );
+      await deleteSessionData(session.id, sessionManager);
+    }
+  } else if (confirmation === 'BATAL') {
+    await deleteSessionData(session.id, sessionManager);
+    await ctx.reply('❌ Transfer dibatalkan.\n\n🔄 Gunakan /transfer untuk memulai transfer baru.');
+  } else {
+    await ctx.reply('❓ Perintah tidak dikenali.\n\nSilakan ketik:\n• <b>KONFIRMASI</b> - untuk melanjutkan transfer\n• <b>BATAL</b> - untuk membatalkan transfer', { parse_mode: 'HTML' });
+  }
+}
+
+/**
+* Setup graceful shutdown handlers
+*/
 function setupGracefulShutdown(bot, db) {
-  process.once('SIGINT', async () => {
-    logger.info('system', 'Received SIGINT signal, shutting down gracefully');
-    bot.stop('SIGINT');
-    await db.close();
-    process.exit(0);
-  });
-  
-  process.once('SIGTERM', async () => {
-    logger.info('system', 'Received SIGTERM signal, shutting down gracefully');
-    bot.stop('SIGTERM');
-    await db.close();
-    process.exit(0);
-  });
+ process.once('SIGINT', async () => {
+   logger.info('system', 'Received SIGINT signal, shutting down gracefully');
+   bot.stop('SIGINT');
+   await db.close();
+   process.exit(0);
+ });
+ 
+ process.once('SIGTERM', async () => {
+   logger.info('system', 'Received SIGTERM signal, shutting down gracefully');
+   bot.stop('SIGTERM');
+   await db.close();
+   process.exit(0);
+ });
 }
